@@ -1,0 +1,13 @@
+{
+  "buildCommand": "npm install --legacy-peer-deps && npm run build",
+  "outputDirectory": "dist",
+  "env": {
+    "VITE_API_URL": "https://delhi-aqi-backend.onrender.com"
+  },
+  "rewrites": [
+    {
+      "source": "/:path*",
+      "destination": "/"
+    }
+  ]
+}
