@@ -1,6 +1,6 @@
 services:
-  - type: web
-    name: delhi-aqi-backend
+  - name: delhi-aqi-backend
+    type: web
     runtime: python
     runtimeVersion: 3.11
     buildCommand: pip install -r requirements.txt
