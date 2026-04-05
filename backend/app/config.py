@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     debug: bool = True
     
     # CORS
-    cors_origins: str = '["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176"]'
+    cors_origins: str = '["http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176", "https://delhi-aqi-frontend.vercel.app", "https://delhi-aqi-predictor.vercel.app", "https://delhi-aqi-frontend-og8k3sxf5-lakshaypal20232704-6255s-projects.vercel.app"]'
     
     class Config:
         env_file = ".env"
