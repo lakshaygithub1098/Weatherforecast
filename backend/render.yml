@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: delhi-aqi-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:8000
+    envVars:
+      - key: CORS_ORIGINS
+        value: '["https://delhi-aqi-predictor.vercel.app","http://localhost:5173"]'
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8000
+      - key: DEBUG
+        value: "False"
+      - key: PYTHONUNBUFFERED
+        value: "1"
