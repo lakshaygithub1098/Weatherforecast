@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # Google API
     google_api_key: str = "your_google_api_key_here"
     
+    # WAQI API for live AQI
+    waqi_api_key: str = "demo"  # Free public key, replace with your token from https://aqicn.org/api/
+    
     # Model paths - use absolute paths
     _models_dir = Path(__file__).parent.parent.parent / "models"
     xgboost_model_path: str = str(_models_dir / "xgboost_aqi_model.pkl")

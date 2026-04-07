@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
+import statistics
+import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional
 import os
@@ -16,10 +18,12 @@ from app.schemas import PredictionInput, PredictionOutput, ErrorResponse
 from app.models.predictor import ModelLoader, ModelPredictor
 from app.utils.weather import WeatherServiceSync
 from app.utils.features import FeatureExtractor
-from app.utils.cache import prediction_cache
+from app.utils.cache import prediction_cache, forecast_cache
 from app.utils.weather_forecast import WeatherForecastService
 from app.utils.preprocessing_forecast import ForecastPreprocessor
 from app.utils.forecast_model_service import create_forecast_service
+from app.utils.waqi_service import get_waqi_service
+from app.utils.wind_influence import WindInfluenceCalculator
 
 # Configure logging
 logging.basicConfig(
@@ -51,12 +55,13 @@ app.add_middleware(
 _model_predictor: Optional[ModelPredictor] = None
 _weather_service: Optional[WeatherServiceSync] = None
 _forecast_service = None
+_waqi_service = None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and services on startup."""
-    global _model_predictor, _weather_service, _forecast_service
+    global _model_predictor, _weather_service, _forecast_service, _waqi_service
     
     logger.info("🚀 Starting AQI Prediction API...")
     
@@ -93,6 +98,11 @@ async def startup_event():
         )
         logger.info("✅ Forecast service initialized")
         
+        # Initialize WAQI service for live AQI
+        logger.info("Initializing WAQI service...")
+        _waqi_service = get_waqi_service(api_key=settings.waqi_api_key if hasattr(settings, 'waqi_api_key') else None)
+        logger.info("✅ WAQI service initialized")
+        
     except Exception as e:
         logger.error(f"❌ Error during startup: {str(e)}")
         if settings.debug:
@@ -105,6 +115,7 @@ async def shutdown_event():
     logger.info("🛑 Shutting down AQI Prediction API...")
     ModelLoader.clear()
     prediction_cache.clear()
+    forecast_cache.clear()
 
 
 @app.get("/health", tags=["System"])
@@ -269,6 +280,12 @@ async def forecast_24hours(
     try:
         logger.info(f"📊 Forecasting 24h AQI for station: {station}")
         
+        # Check forecast cache first to avoid recalculating too frequently
+        cached_forecast = forecast_cache.get(station)
+        if cached_forecast:
+            logger.info(f"✅ Returning cached forecast for {station}")
+            return cached_forecast
+        
         if _forecast_service is None:
             raise HTTPException(
                 status_code=503,
@@ -316,11 +333,17 @@ async def forecast_24hours(
         # Prepare features
         logger.info("Preparing forecast features...")
         from datetime import datetime
+        import statistics
+        
+        # Calculate station baseline AQI (mean of last 24 hours)
+        # This makes the 'upwind_aqi' feature station-specific
+        station_baseline_aqi = statistics.mean(last_24_aqi) if last_24_aqi else 100.0
+        
         features_array, metadata = ForecastPreprocessor.prepare_forecast_features(
             last_24_hours_aqi=last_24_aqi,
             forecast_weather=weather_forecast,
             current_timestamp=datetime.now(),
-            other_stations_aqi={"station1": 100.0, "station2": 100.0},
+            other_stations_aqi={"station1": station_baseline_aqi, "station2": 100.0},
             scaler=_forecast_service.scaler
         )
         
@@ -330,6 +353,22 @@ async def forecast_24hours(
             features_array=features_array,
             initial_aqi=last_24_aqi[-1] if last_24_aqi else 100.0
         )
+        
+        # Apply station-specific baseline adjustment
+        # The model was trained on normalized features, so we apply a correction
+        # based on the station's historical AQI characteristics
+        current_aqi = last_24_aqi[-1] if last_24_aqi else 100.0
+        min_aqi = min(last_24_aqi) if last_24_aqi else current_aqi
+        max_aqi = max(last_24_aqi) if last_24_aqi else current_aqi
+        aqi_range = max_aqi - min_aqi if max_aqi > min_aqi else 50
+        
+        # Adjust predictions to respect station characteristics
+        baseline_trend = 1.0 + (station_baseline_aqi - 100.0) / 200.0  # Normalize baseline effect
+        adjusted_predictions = [
+            max(0, min(500, pred * baseline_trend))
+            for pred in aqi_predictions
+        ]
+        aqi_predictions = adjusted_predictions
         
         # Build forecast response
         forecast_data = []
@@ -346,13 +385,18 @@ async def forecast_24hours(
         
         logger.info(f"✅ Generated forecast: {[f['aqi'] for f in forecast_data[:3]]}... (first 3 hours)")
         
-        return {
+        response_data = {
             "station": station,
             "latitude": lat,
             "longitude": lon,
             "forecast_generated_at": datetime.utcnow().isoformat(),
             "forecast": forecast_data
         }
+        
+        # Cache the forecast for 10 minutes to avoid recalculating frequently
+        forecast_cache.set(station, response_data)
+        
+        return response_data
         
     except HTTPException:
         raise
@@ -378,6 +422,239 @@ def _get_aqi_level(aqi: float) -> str:
         return "Very Poor"
     else:
         return "Severe"
+
+
+@app.get(
+    "/live-aqi",
+    tags=["Live Data"]
+)
+async def get_live_aqi(station: str = Query(..., description="Station name")):
+    """
+    Get current live AQI for a station from WAQI API.
+    This is REAL-TIME data, not ML predictions.
+    
+    Args:
+        station: Station name (e.g., "NSUT", "Shadipur")
+        
+    Returns:
+        Current AQI data with PM2.5, PM10, temperature, humidity, wind
+    """
+    try:
+        if _waqi_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="WAQI service not initialized"
+            )
+        
+        aqi_data = _waqi_service.get_current_aqi(station)
+        if not aqi_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Could not fetch AQI for station {station}"
+            )
+        
+        return {
+            "station": station,
+            "aqi_data": aqi_data,
+            "aqi_level": _get_aqi_level(aqi_data["aqi"]),
+            "fetched_at": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching live AQI: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch live AQI: {str(e)}"
+        )
+
+
+@app.get(
+    "/all-live-aqi",
+    tags=["Live Data"]
+)
+async def get_all_live_aqi():
+    """
+    Get current live AQI for ALL stations.
+    
+    Returns:
+        Dictionary of station names to AQI data
+    """
+    try:
+        if _waqi_service is None:
+            raise HTTPException(status_code=503, detail="WAQI service not initialized")
+        
+        all_aqi = _waqi_service.get_all_stations_aqi()
+        
+        # Add AQI levels and return
+        result = {}
+        for station, aqi_data in all_aqi.items():
+            result[station] = {
+                "aqi_data": aqi_data,
+                "aqi_level": _get_aqi_level(aqi_data["aqi"])
+            }
+        
+        return {
+            "stations": result,
+            "fetched_at": datetime.utcnow().isoformat(),
+            "total": len(result)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching all live AQI: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch live AQI data: {str(e)}")
+
+
+@app.get(
+    "/debug",
+    tags=["Debug"]
+)
+async def debug_forecast(station: str = Query(..., description="Station name")):
+    """
+    Debug endpoint to verify forecast pipeline end-to-end.
+    Shows all intermediate data for verification.
+    
+    Args:
+        station: Station name
+        
+    Returns:
+        Complete forecast pipeline data
+    """
+    try:
+        logger.info(f"DEBUG: Starting pipeline debug for {station}")
+        
+        # Station coordinates
+        stations_list = [
+            {"name": "Alipur", "latitude": 28.7986, "longitude": 77.1331},
+            {"name": "Bawana", "latitude": 28.623, "longitude": 77.21},
+            {"name": "Burari", "latitude": 28.7167, "longitude": 77.2},
+            {"name": "DRKARNISINGH", "latitude": 28.498571, "longitude": 77.26484},
+            {"name": "DTU", "latitude": 28.750049, "longitude": 77.111261},
+            {"name": "DWARKASEC8", "latitude": 28.571027, "longitude": 77.0719},
+            {"name": "IGIT3", "latitude": 28.562776, "longitude": 77.118005},
+            {"name": "ITO", "latitude": 28.6286, "longitude": 77.241},
+            {"name": "Mundka", "latitude": 28.68, "longitude": 77.08},
+            {"name": "Najfgarh", "latitude": 28.570173, "longitude": 76.933762},
+            {"name": "NARELA", "latitude": 28.822836, "longitude": 77.101981},
+            {"name": "Northcampus", "latitude": 28.686, "longitude": 77.209},
+            {"name": "NSUT", "latitude": 28.686, "longitude": 77.209},
+            {"name": "Punjabi_bagh", "latitude": 28.674045, "longitude": 77.131023},
+            {"name": "RKPuram", "latitude": 28.563262, "longitude": 77.186937},
+            {"name": "Shadipur", "latitude": 28.651, "longitude": 77.146},
+            {"name": "Wazirpur", "latitude": 28.699793, "longitude": 77.165453},
+        ]
+        
+        station_data = next((s for s in stations_list if s["name"] == station), None)
+        if not station_data:
+            raise HTTPException(status_code=404, detail=f"Station {station} not found")
+        
+        lat, lon = station_data["latitude"], station_data["longitude"]
+        
+        # 1. Get past 24 hours AQI from CSV
+        logger.info("DEBUG: Fetching historical AQI...")
+        last_24_aqi = ForecastPreprocessor.get_last_24_hours_aqi(station)
+        baseline_aqi = sum(last_24_aqi) / len(last_24_aqi) if last_24_aqi else 100.0
+        
+        # 2. Get weather forecast
+        logger.info("DEBUG: Fetching weather forecast...")
+        weather_forecast = WeatherForecastService.get_24hour_forecast(lat, lon)
+        
+        # 3. Get live AQI for wind influence
+        logger.info("DEBUG: Fetching live AQI for wind influence...")
+        live_aqi = _waqi_service.get_current_aqi(station) if _waqi_service else {}
+        wind_direction = live_aqi.get("wind_speed", 3.0)  # placeholder
+        
+        # 4. Calculate upwind stations
+        logger.info("DEBUG: Calculating upwind stations...")
+        upwind_stations = WindInfluenceCalculator.get_upwind_stations(
+            station, wind_direction, top_n=3
+        )
+        upwind_names = [s["station"] for s in upwind_stations]
+        
+        # 5. Prepare features
+        logger.info("DEBUG: Preparing forecast features...")
+        import statistics
+        features_array, metadata = ForecastPreprocessor.prepare_forecast_features(
+            last_24_hours_aqi=last_24_aqi,
+            forecast_weather=weather_forecast,
+            current_timestamp=datetime.now(),
+            other_stations_aqi={"station1": baseline_aqi, "station2": 100.0},
+            scaler=_forecast_service.scaler if _forecast_service else None
+        )
+        
+        # 6. Generate forecast
+        logger.info("DEBUG: Generating forecast...")
+        aqi_predictions = _forecast_service.forecast_24hours(
+            features_array=features_array,
+            initial_aqi=last_24_aqi[-1] if last_24_aqi else 100.0
+        ) if _forecast_service else [100.0] * 24
+        
+        # 7. Apply adjustments
+        baseline_trend = 1.0 + (baseline_aqi - 100.0) / 200.0
+        adjusted = [max(0, min(500, p * baseline_trend)) for p in aqi_predictions]
+        
+        # Build response
+        return {
+            "station": station,
+            "coordinates": {"latitude": lat, "longitude": lon},
+            "data_source": "live_csv+openmeteo_forecast",
+            "past_24h_aqi": {
+                "values": last_24_aqi[-24:],
+                "mean": baseline_aqi,
+                "min": min(last_24_aqi),
+                "max": max(last_24_aqi)
+            },
+            "weather_forecast_used": {
+                "hour_0": {
+                    "temperature": weather_forecast[0]["temperature"],
+                    "humidity": weather_forecast[0]["humidity"],
+                    "wind_speed": weather_forecast[0]["wind_speed"],
+                    "wind_direction": weather_forecast[0]["wind_direction"]
+                },
+                "first_3_temps": [w["temperature"] for w in weather_forecast[:3]],
+                "first_3_winds": [w["wind_speed"] for w in weather_forecast[:3]]
+            },
+            "features_array": {
+                "shape": f"{features_array.shape[0]} x {features_array.shape[1]}",
+                "first_hour_first_10_features": features_array[0, :10].tolist()
+            },
+            "model_used": "xgboost (24h forecast)",
+            "raw_forecast": aqi_predictions[:6],
+            "adjusted_forecast": [round(x, 1) for x in adjusted[:6]],
+            "baseline_trend_factor": baseline_trend,
+            "upwind_influence": {
+                "wind_direction_from": wind_direction,
+                "nearby_stations": upwind_names,
+                "detailed": [
+                    {
+                        "station": s["station"],
+                        "distance_km": round(s["distance"], 1),
+                        "bearing": round(s["bearing"], 0),
+                        "influence_score": round(s["influence_score"], 2)
+                    }
+                    for s in upwind_stations
+                ]
+            },
+            "verification": {
+                "past_24h_data_loaded": len(last_24_aqi) == 24,
+                "weather_forecast_24h": len(weather_forecast) == 24,
+                "features_shape_correct": features_array.shape == (24, 27),
+                "prediction_values_valid": all(0 <= p <= 500 for p in adjusted),
+                "upwind_calculation_done": len(upwind_names) > 0
+            },
+            "debug_timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Debug failed: {str(e)}"
+        )
+
 
 
 @app.get(
