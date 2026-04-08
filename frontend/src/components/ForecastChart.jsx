@@ -80,9 +80,19 @@ export const ForecastChart = ({ station, onClose }) => {
     )
   }
 
+  // Helper function to format time in 12-hour AM/PM format
+  const formatTimeAMPM = (timestamp) => {
+    const date = new Date(timestamp)
+    let hours = date.getHours()
+    const ampm = hours >= 12 ? 'PM' : 'AM'
+    hours = hours % 12
+    hours = hours ? hours : 12 // Convert 0 to 12
+    return `${hours}:00 ${ampm}`
+  }
+
   // Format data for chart
   const chartData = forecast.forecast.map(point => ({
-    time: new Date(point.timestamp).getHours().toString().padStart(2, '0') + ':00',
+    time: formatTimeAMPM(point.timestamp),
     aqi: parseFloat(point.aqi),
     temperature: point.temperature,
     humidity: point.humidity,

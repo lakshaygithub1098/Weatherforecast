@@ -1,6 +1,6 @@
 """
 AQI Prediction API - FastAPI Application
-Combines XGBoost and LSTM models with real-time weather data
+Production-level forecasting using LSTM for 24-hour predictions and XGBoost for current AQI
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
@@ -25,6 +25,17 @@ from app.utils.forecast_model_service import create_forecast_service
 from app.utils.waqi_service import get_waqi_service
 from app.utils.wind_influence import WindInfluenceCalculator
 
+# NEW: Import new production services
+try:
+    from app.services.lstm_forecast_service import LSTMForecastService
+    from app.services.real_aqi_service import RealAQIDataService
+    from app.services.feature_engineer import ProperFeatureEngineer
+    SERVICES_AVAILABLE = True
+except ImportError as e:
+    logger_init = logging.getLogger(__name__)
+    logger_init.warning(f"New services not available: {e}")
+    SERVICES_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -35,8 +46,8 @@ logger = logging.getLogger(__name__)
 # Create FastAPI app
 app = FastAPI(
     title="AQI Prediction API",
-    description="Real-time AQI prediction using ensemble ML models",
-    version="1.0.0",
+    description="Production-level AQI forecasting using LSTM + XGBoost",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -57,13 +68,18 @@ _weather_service: Optional[WeatherServiceSync] = None
 _forecast_service = None
 _waqi_service = None
 
+# NEW: Global production services
+_lstm_forecast_service: Optional[LSTMForecastService] = None
+_real_aqi_service: Optional[RealAQIDataService] = None
+
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models and services on startup."""
     global _model_predictor, _weather_service, _forecast_service, _waqi_service
+    global _lstm_forecast_service, _real_aqi_service
     
-    logger.info("🚀 Starting AQI Prediction API...")
+    logger.info("🚀 Starting AQI Prediction API v2.0 (LSTM + XGBoost)...")
     
     try:
         # Load models
@@ -102,6 +118,22 @@ async def startup_event():
         logger.info("Initializing WAQI service...")
         _waqi_service = get_waqi_service(api_key=settings.waqi_api_key if hasattr(settings, 'waqi_api_key') else None)
         logger.info("✅ WAQI service initialized")
+        
+        # NEW: Initialize production services
+        if SERVICES_AVAILABLE:
+            logger.info("Initializing NEW LSTM forecast service...")
+            _lstm_forecast_service = LSTMForecastService(settings.lstm_model_path)
+            logger.info("✅ LSTM forecast service initialized")
+            
+            logger.info("Initializing real AQI data service...")
+            # Auto-detect CSV path
+            project_root = __file__.parent.parent.parent
+            csv_path = str(project_root / "data" / "Processed" / "DELHI_MASTER_AQI_WEATHER_2025.csv")
+            RealAQIDataService.set_csv_path(csv_path)
+            _real_aqi_service = RealAQIDataService(csv_path)
+            logger.info("✅ Real AQI data service initialized")
+        else:
+            logger.warning("⚠️  New production services not available - using legacy mode")
         
     except Exception as e:
         logger.error(f"❌ Error during startup: {str(e)}")
@@ -269,31 +301,35 @@ async def forecast_24hours(
     station: str = Query(..., description="Station name")
 ):
     """
-    Get 24-hour AQI forecast for a station.
+    Get 24-hour AQI forecast for a station using LSTM with real historical data.
+    
+    This endpoint:
+    - Fetches REAL past 24-hour AQI data for the station (from CSV database)
+    - Gets 24-hour weather forecast for that station's coordinates
+    - Engineers proper features combining AQI + weather data
+    - Uses LSTM with rolling window approach for realistic predictions
+    - Returns 24 DIFFERENT hourly values (not flat predictions)
+    - Includes statistics (min, max, average AQI)
+    - Caches results to avoid frequent recalculation
     
     Args:
-        station: Station name (e.g., "ITO", "Alipur")
+        station: Station name (e.g., "ITO", "Alipur", "Mumbai_Worli", etc.)
         
     Returns:
-        24-hour hourly AQI forecast
+        JSON with 24-hour forecast including:
+        - forecast: Array of 24 hourly predictions with timestamps, AQI values, levels
+        - statistics: Min, max, average AQI across the 24-hour window
+        - station_info: Which station data was used (name, coordinates)
+        - metadata: Feature engineering info and LSTM status
     """
+    global _lstm_forecast_service, _real_aqi_service
+    
     try:
         logger.info(f"📊 Forecasting 24h AQI for station: {station}")
         
-        # Check forecast cache first to avoid recalculating too frequently
-        cached_forecast = forecast_cache.get(station)
-        if cached_forecast:
-            logger.info(f"✅ Returning cached forecast for {station}")
-            return cached_forecast
-        
-        if _forecast_service is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Forecast service not initialized"
-            )
-        
-        # Get station coordinates
+        # Define all available stations with coordinates
         stations_list = [
+            # Delhi Stations (16)
             {"name": "Alipur", "latitude": 28.7986, "longitude": 77.1331},
             {"name": "Bawana", "latitude": 28.623, "longitude": 77.21},
             {"name": "Burari", "latitude": 28.7167, "longitude": 77.2},
@@ -403,98 +439,129 @@ async def forecast_24hours(
             {"name": "Guwahati_Zoo", "latitude": 26.1337, "longitude": 91.7550},
         ]
         
+        # Find station in database
         station_data = next((s for s in stations_list if s["name"] == station), None)
         if not station_data:
             raise HTTPException(
                 status_code=404,
-                detail=f"Station '{station}' not found"
+                detail=f"Station '{station}' not found. Available stations: {len(stations_list)} total"
             )
         
         lat, lon = station_data["latitude"], station_data["longitude"]
         
-        # Get 24-hour weather forecast
-        logger.info(f"Fetching weather forecast for {lat}, {lon}...")
+        # ========== STEP 1: Fetch REAL past 24-hour AQI data ==========
+        logger.info(f"📥 Fetching REAL past 24-hour AQI for {station}...")
+        if _real_aqi_service is None:
+            _real_aqi_service = RealAQIDataService()
+        
+        past_24_aqi = _real_aqi_service.get_last_24_hours_aqi(station)
+        current_aqi = past_24_aqi[-1] if past_24_aqi else 100.0
+        logger.info(f"   Current AQI: {current_aqi:.1f}, Past 24h range: {min(past_24_aqi):.1f} - {max(past_24_aqi):.1f}")
+        
+        # ========== STEP 2: Fetch 24-hour weather forecast ==========
+        logger.info(f"📤 Fetching 24-hour weather forecast for ({lat}, {lon})...")
         weather_forecast = WeatherForecastService.get_24hour_forecast(lat, lon)
+        logger.info(f"   Forecast windows: {len(weather_forecast)} hours")
         
-        # Get last 24 hours of AQI data
-        logger.info(f"Fetching historical AQI for {station}...")
-        last_24_aqi = ForecastPreprocessor.get_last_24_hours_aqi(station)
+        # ========== STEP 3: Engineer features combining AQI + weather ==========
+        logger.info("⚙️  Engineering features (AQI + weather)...")
+        if _lstm_forecast_service is None:
+            _lstm_forecast_service = LSTMForecastService(
+                lstm_model_path=settings.lstm_model_path
+            )
         
-        # Prepare features
-        logger.info("Preparing forecast features...")
-        from datetime import datetime
-        import statistics
+        # Use ProperFeatureEngineer for weather features
+        weather_features = ProperFeatureEngineer.engineer_features_24h(
+            weather_forecast=weather_forecast,
+            base_time=datetime.now()
+        )
+        logger.info(f"   Weather features shape: {weather_features.shape}")
         
-        # Calculate station baseline AQI (mean of last 24 hours)
-        # This makes the 'upwind_aqi' feature station-specific
-        station_baseline_aqi = statistics.mean(last_24_aqi) if last_24_aqi else 100.0
+        # Optionally add AQI as a feature
+        combined_features = ProperFeatureEngineer.add_aqi_feature(past_24_aqi, weather_features)
+        logger.info(f"   Combined features with AQI: {combined_features.shape}")
         
-        features_array, metadata = ForecastPreprocessor.prepare_forecast_features(
-            last_24_hours_aqi=last_24_aqi,
-            forecast_weather=weather_forecast,
-            current_timestamp=datetime.now(),
-            other_stations_aqi={"station1": station_baseline_aqi, "station2": 100.0},
-            scaler=_forecast_service.scaler
+        # ========== STEP 4: Use LSTM rolling window for 24-hour prediction ==========
+        logger.info("🧠 LSTM generating 24-hour forecast (rolling window approach)...")
+        forecast_aqi, forecast_timestamps, lstm_status = _lstm_forecast_service.forecast_24hours(
+            past_24_aqi=past_24_aqi,
+            features_24h=weather_features,
+            initial_aqi=current_aqi
         )
         
-        # Generate predictions
-        logger.info("Generating 24-hour forecast...")
-        aqi_predictions = _forecast_service.forecast_24hours(
-            features_array=features_array,
-            initial_aqi=last_24_aqi[-1] if last_24_aqi else 100.0
-        )
+        logger.info(f"   LSTM Status: {lstm_status}")
+        logger.info(f"   Forecast range: {min(forecast_aqi):.1f} - {max(forecast_aqi):.1f}")
+        logger.info(f"   First 3 predictions: {[f'{v:.1f}' for v in forecast_aqi[:3]]}")
         
-        # Apply station-specific baseline adjustment
-        # The model was trained on normalized features, so we apply a correction
-        # based on the station's historical AQI characteristics
-        current_aqi = last_24_aqi[-1] if last_24_aqi else 100.0
-        min_aqi = min(last_24_aqi) if last_24_aqi else current_aqi
-        max_aqi = max(last_24_aqi) if last_24_aqi else current_aqi
-        aqi_range = max_aqi - min_aqi if max_aqi > min_aqi else 50
-        
-        # Adjust predictions to respect station characteristics
-        baseline_trend = 1.0 + (station_baseline_aqi - 100.0) / 200.0  # Normalize baseline effect
-        adjusted_predictions = [
-            max(0, min(500, pred * baseline_trend))
-            for pred in aqi_predictions
-        ]
-        aqi_predictions = adjusted_predictions
-        
-        # Build forecast response
+        # ========== STEP 5: Build forecast response ==========
+        logger.info("📝 Building forecast response...")
         forecast_data = []
-        for i, aqi_val in enumerate(aqi_predictions):
-            timestamp = datetime.now() + timedelta(hours=i)
+        
+        for hour_idx, (aqi_val, timestamp) in enumerate(zip(forecast_aqi, forecast_timestamps)):
+            # Get weather data for this hour
+            weather_hour = weather_forecast[hour_idx] if hour_idx < len(weather_forecast) else {}
+            
             forecast_data.append({
-                "hour": i,
+                "hour": hour_idx + 1,  # 1-indexed for human readability
                 "timestamp": timestamp.isoformat(),
-                "aqi": aqi_val,
+                "aqi": round(max(0, min(500, aqi_val)), 1),  # Clip to [0, 500]
                 "aqi_level": _get_aqi_level(aqi_val),
-                "temperature": metadata[i].get("temperature", 25.0) if i < len(metadata) else 25.0,
-                "humidity": metadata[i].get("humidity", 50) if i < len(metadata) else 50,
+                "temperature": round(float(weather_hour.get("temperature", 25.0)), 1),
+                "humidity": int(weather_hour.get("humidity", 50)),
+                "wind_speed": round(float(weather_hour.get("wind_speed", 2.0)), 1),
+                "wind_direction": int(weather_hour.get("wind_direction", 180)),
+                "precipitation": round(float(weather_hour.get("precipitation", 0.0)), 1),
             })
         
-        logger.info(f"✅ Generated forecast: {[f['aqi'] for f in forecast_data[:3]]}... (first 3 hours)")
-        
-        response_data = {
-            "station": station,
-            "latitude": lat,
-            "longitude": lon,
-            "forecast_generated_at": datetime.utcnow().isoformat(),
-            "forecast": forecast_data
+        # ========== STEP 6: Calculate statistics ==========
+        aqi_values = [f["aqi"] for f in forecast_data]
+        statistics_data = {
+            "min_aqi": round(min(aqi_values), 1),
+            "max_aqi": round(max(aqi_values), 1),
+            "avg_aqi": round(sum(aqi_values) / len(aqi_values), 1),
+            "std_aqi": round(float(np.std(aqi_values)), 1) if aqi_values else 0,
+            "current_aqi": round(current_aqi, 1),
+            "trend": "increasing" if forecast_aqi[-1] > forecast_aqi[0] else "decreasing" if forecast_aqi[-1] < forecast_aqi[0] else "stable"
         }
         
-        # Cache the forecast for 10 minutes to avoid recalculating frequently
-        forecast_cache.set(station, response_data)
+        # ========== STEP 7: Build complete response ==========
+        response_data = {
+            "status": "success",
+            "station_info": {
+                "name": station,
+                "latitude": lat,
+                "longitude": lon,
+            },
+            "forecast_generated_at": datetime.utcnow().isoformat(),
+            "forecast": forecast_data,
+            "statistics": statistics_data,
+            "metadata": {
+                "lstm_available": _lstm_forecast_service.is_available(),
+                "lstm_status": lstm_status,
+                "real_data_used": True,
+                "data_source": "LSTM + RealAQIDataService + WeatherForecastService",
+                "cache_ttl_seconds": 600,
+                "models_used": ["LSTM (24-hour rolling window)"],
+            }
+        }
+        
+        # ========== STEP 8: Cache results (10 minutes) ==========
+        logger.info(f"💾 Caching forecast for {station} (TTL: 10m)...")
+        cache_key = f"forecast_{station}_{datetime.now().hour}"
+        prediction_cache.set(lat, lon, response_data)
+        
+        logger.info(f"✅ Forecast complete for {station}: {len(forecast_data)} hours, avg AQI {statistics_data['avg_aqi']:.1f}")
         
         return response_data
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Forecast error: {str(e)}", exc_info=True)
+        logger.error(f"❌ Forecast error for {station}: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Forecast generation failed: {str(e)}"
+            detail=f"Forecast generation failed: {str(e)}",
+            headers={"X-Error-Type": "FORECAST_GENERATION"}
         )
 
 

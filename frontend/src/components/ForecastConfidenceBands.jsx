@@ -11,11 +11,23 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
  * - title: Chart title (e.g., "NSUT 24-Hour Forecast")
  */
 export const ForecastConfidenceBands = ({ forecast, rmse = 18, title = '24-Hour AQI Forecast' }) => {
+  // Helper function to format hour in 12-hour AM/PM format
+  const formatHourAMPM = (hourValue) => {
+    if (typeof hourValue === 'number') {
+      let hours = hourValue % 24
+      const ampm = hours >= 12 ? 'PM' : 'AM'
+      hours = hours % 12
+      hours = hours ? hours : 12 // Convert 0 to 12
+      return `${hours}:00 ${ampm}`
+    }
+    return hourValue
+  }
+
   const data = useMemo(() => {
     if (!forecast || !Array.isArray(forecast)) return []
 
     return forecast.map((item, index) => ({
-      hour: item.hour || `Hour ${index}`,
+      hour: formatHourAMPM(item.hour) || formatHourAMPM(index),
       aqi: Math.round(item.aqi || 0),
       upper: Math.round((item.aqi || 0) + rmse),
       lower: Math.max(0, Math.round((item.aqi || 0) - rmse)),
